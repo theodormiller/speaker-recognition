@@ -1,0 +1,286 @@
+#! /usr/bin/env python3
+import torch
+import torchaudio
+import torchvision
+import os
+from torch.utils.data import Dataset, DataLoader
+import pytorch_lightning as pl
+from torchmetrics import Accuracy
+import torch.nn.functional as F
+import argparse
+import random
+import torch.nn as nn
+
+# These should be relative to cwd
+TRAIN_DIR = "train"
+DEV_DIR = "dev"
+
+class AudioDataset(Dataset):
+    def __init__(self, path, train=True):
+        super().__init__()
+        self.dir_path = os.path.join(path)
+        print("Loading files from", path)
+        dirfiles = os.listdir(path)
+        # Loads only the file names (i.e. file0)
+        self.audiofiles = [name.split(".")[0] for name in dirfiles if name.endswith(".wav")]
+        self.labels = []
+        for name in self.audiofiles:
+            labelpath = os.path.join(self.dir_path, name + ".spkid.txt")
+            with open(labelpath) as input:
+                label = int(input.read())
+            self.labels.append(label)
+        self.labels, self.indices = torch.sort(torch.tensor(self.labels))
+
+        print("loaded", len(self.audiofiles), "files")
+        self.transform = torch.nn.Sequential(
+            torchaudio.transforms.MelSpectrogram(16000),
+            torchvision.transforms.Resize(size=(128,300))
+        )
+
+    def __len__(self):
+        return len(self.audiofiles)
+
+    def _load(self, idx):
+        filenameindex = self.indices[idx]
+        filename = self.audiofiles[filenameindex]
+        audiopath = os.path.join(self.dir_path, filename + ".wav")
+        waveform, sample_rate = torchaudio.load(audiopath)
+        waveform = self.transform(waveform)
+        return waveform
+
+    def __getitem__(self, idx):
+        waveform1 = self._load(idx)
+        label1 = self.labels[idx]
+
+        choice = 0
+        if random.random() > 0.5:
+            # Select a nearby value - likely to be the same class
+            nearby = random.randint(-4, 4)
+            choice = idx + nearby
+        else:
+            # Select a value at random
+            choice = random.randint(0, len(self.labels))
+
+        if choice < 0:
+            choice = 0
+        elif choice >= len(self.labels):
+            choice = len(self.labels) - 1
+
+        waveform2 = self._load(choice)
+        label2 = self.labels[choice]
+
+        
+        waveform = torch.hstack((waveform1, waveform2))
+        label = 1 if label1 == label2 else 0
+        
+        
+        return waveform, label
+
+    
+
+
+
+
+
+class AudioDataModule(pl.LightningDataModule):
+    def __init__(self,mb=4,pin_memory=False,num_workers=0,val_n=5000):
+        super().__init__()
+
+        self.mb = mb
+        self.pin_memory = pin_memory
+        self.num_workers = num_workers
+        self.val_n = val_n 
+
+    def setup(self,stage=None):
+        if stage=="fit" or stage is None:
+            self.trainset = AudioDataset(TRAIN_DIR, train=True)
+            self.devset = AudioDataset(DEV_DIR, train=True)
+        
+        #if stage == "test":
+            #self.testset
+
+    def train_dataloader(self):
+        return DataLoader(self.trainset, shuffle=True, batch_size=self.mb, 
+                pin_memory=self.pin_memory, num_workers=self.num_workers)
+
+    def val_dataloader(self):
+        return DataLoader(self.devset, batch_size=self.mb, 
+                pin_memory=self.pin_memory, num_workers=self.num_workers)
+
+
+
+
+
+
+
+class SpeakerModel(pl.LightningModule):
+    def __init__(self, lr=0.1,optimizer="adam", hidden1=16, hidden2=32, hidden3=64, hidden4=128, hidden5=64, out_factor=340, n_classes=1):
+        super().__init__()
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(
+                in_channels=1,
+                out_channels=hidden1,
+                kernel_size=3,
+                stride=1,
+                padding=2
+            ),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2)
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(
+                in_channels=hidden1,
+                out_channels=hidden2,
+                kernel_size=3,
+                stride=1,
+                padding=2
+            ),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2)
+        )
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(
+                in_channels=hidden2,
+                out_channels=hidden3,
+                kernel_size=3,
+                stride=1,
+                padding=2
+            ),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2)
+        )
+        self.conv4 = nn.Sequential(
+            nn.Conv2d(
+                in_channels=hidden3,
+                out_channels=hidden4,
+                kernel_size=3,
+                stride=1,
+                padding=2
+            ),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2)
+        )
+        self.flatten = nn.Flatten()
+        self.linear = nn.Sequential(
+            nn.Linear(hidden4 * out_factor, hidden5),
+            nn.ReLU()
+        )
+        self.linear2 = nn.Linear(hidden5, n_classes)
+        self.sigmoid = nn.Sigmoid()
+
+        self.lr = lr
+        self.optimizer = optimizer
+        self.accuracy = Accuracy()
+        self.criterion = nn.BCELoss()
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.conv3(x)
+        x = self.conv4(x)
+        x = self.flatten(x)
+        x = self.linear(x)
+        logits = self.linear2(x)
+        predictions = self.sigmoid(logits)
+        return predictions
+
+    def eval_batch(self, batch, batch_idx):
+        x, y = batch
+        y_pred = self(x).reshape(-1)
+        loss = self.criterion(y_pred, y.to(torch.float))
+        predictions = y_pred.clone().detach().round().to(torch.float).reshape(-1)
+        acc = self.accuracy(predictions, y)
+
+        return loss, acc
+
+    def training_step(self, batch, batch_idx):
+        loss, acc = self.eval_batch(batch, batch_idx)
+
+        x,y = batch
+        self.log('train_loss', loss)
+        self.log('train_acc', acc)
+
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        loss,acc = self.eval_batch(batch,batch_idx)
+
+
+        self.log('val_loss', loss)
+        self.log('val_acc', acc, prog_bar=True)
+
+    def test_step(self, batch, batch_idx):
+        loss,acc = self.eval_batch(batch,batch_idx)
+
+        self.log('test_loss', loss)
+        self.log('test_acc', acc)
+
+    def configure_optimizers(self):
+        optimizer = None
+        if self.optimizer == "adam":
+            optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
+        elif self.optimizer == "adadelta":
+            optimizer = torch.optim.Adadelta(self.parameters(), lr=self.lr)
+        elif self.optimizer == "adagrad":
+            optimizer = torch.optim.Adagrad(self.parameters(), lr=self.lr)
+        elif self.optimizer == "rmsprop":
+            optimizer = torch.optim.RMSprop(self.parameters(), lr=self.lr)
+        elif self.optimizer == "sgd":
+            optimizer = torch.optim.SGD(self.parameters(), lr=self.lr)
+        else:
+            raise ValueError("Unrecognized optimizer")
+        return optimizer
+
+
+
+
+
+
+
+def parse_all_args():
+# Parses commandline arguments
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("-lr",type=float,\
+            help="The learning rate (float) [default: 0.1]",default=0.1)
+    parser.add_argument("-mb",type=int,\
+            help="The minibatch size (int) [default: 4]",default=4)
+    parser.add_argument("-epochs",type=int,\
+            help="The number of training epochs (int) [default: 100]",\
+            default=100)
+    parser.add_argument("-opt",\
+            help='The optimizer: "adadelta", "adagrad", "adam", "rmsprop", "sgd" \
+            (string) [default: "adam"]', default="adam")
+
+    return parser.parse_args()
+
+
+def main():
+    # train_dataset = AudioDataset(TRAIN_DIR)
+    # print(train_dataset[0][0].shape)
+    # exit(0)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    args = parse_all_args()
+    data = AudioDataModule(mb=args.mb, num_workers=8)
+    # data.to(device)
+    # data.setup()
+    # trainloader = data.train_dataloader()
+    # print(trainloader[0])
+    # exit(0)
+    model = SpeakerModel(lr=args.lr, optimizer=args.opt)
+    model.to(device)
+    print("Created Model")
+    trainer = pl.Trainer(max_epochs=args.epochs, accelerator="auto", devices=-1)
+    trainer.fit(model, data)
+
+    # dev_dataset = AudioDataset(DEV_DIR)
+    # trainloader = DataLoader(train_dataset)
+    # print(train_dataset[0][0].shape)
+    # print(dev_dataset[0][0].shape)
+    # print("in main")
+
+
+
+if __name__ == '__main__':
+    main()
